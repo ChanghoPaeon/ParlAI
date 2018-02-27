@@ -527,6 +527,7 @@
     socket.onopen = () => {
       log('Server connected.', 2);
       send_alive();
+
       _heartbeat_thread();
     }
 

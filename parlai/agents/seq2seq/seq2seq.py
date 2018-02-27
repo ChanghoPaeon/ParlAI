@@ -126,6 +126,15 @@ class Seq2seqAgent(Agent):
                                 'Any member of torch.optim is valid and will '
                                 'be used with default params except learning '
                                 'rate (as specified by -lr).')
+        # agent.add_argument('-emb', '--embedding-type', default='random',
+        #                    choices=['random'],
+        #                    help='Choose between different strategies '
+        #                         'for word embeddings. Default is random, '
+        #                         'but can also preinitialize from Glove.'
+        #                         'Preinitialized embeddings can also be fixed '
+        #                         'so they are not updated during training. '
+        #                         'NOTE: glove init currently disabled.')
+
         agent.add_argument('-emb', '--embedding-type', default='random',
                            choices=['random', 'glove', 'glove-fixed',
                                     'fasttext', 'fasttext-fixed'],
@@ -135,6 +144,20 @@ class Seq2seqAgent(Agent):
                                 'Fasttext.'
                                 'Preinitialized embeddings can also be fixed '
                                 'so they are not updated during training.')
+
+
+        agent.add_argument('-lm', '--language-model', default='none',
+                           choices=['none', 'only', 'both'],
+                           help='Enabled language modeling training on the '
+                                'concatenated input and label data.')
+        agent.add_argument('-hist', '--history-length', default=100000, type=int,
+                           help='Number of past tokens to remember. '
+                                'Default remembers 100000 tokens.')
+        agent.add_argument('-histr', '--history-replies',
+                           default='none', type=str,
+                           choices=['none', 'model', 'label'],
+                           help='Keep replies in the history, or not.')
+
 
     def __init__(self, opt, shared=None):
         """Set up model if shared params not set, otherwise no work to do."""
@@ -255,10 +278,12 @@ class Seq2seqAgent(Agent):
             # if model was built, do more setup
             self.clip = opt.get('gradient_clip', 0.2)
             self.rank = opt['rank_candidates']
+            self.lm = opt['language_model']
 
             # set up tensors once
             self.xs = torch.LongTensor(1, 1)
             self.ys = torch.LongTensor(1, 1)
+            self.ps = torch.LongTensor(1, 1)
             if self.rank:
                 self.cands = torch.LongTensor(1, 1, 1)
 
@@ -267,8 +292,11 @@ class Seq2seqAgent(Agent):
 
             if self.use_cuda:
                 # push to cuda
-                self.xs = self.xs.cuda()
-                self.ys = self.ys.cuda()
+
+                self.xs = self.xs.cuda(async=True)
+                self.ys = self.ys.cuda(async=True)
+                self.ps = self.ps.cuda(async=True)
+
                 if self.rank:
                     self.cands = self.cands.cuda()
                 self.criterion.cuda()
@@ -342,7 +370,8 @@ class Seq2seqAgent(Agent):
 
     def update_params(self):
         """Do one optimization step."""
-        torch.nn.utils.clip_grad_norm(self.model.parameters(), self.clip)
+        if self.clip > 0:
+            torch.nn.utils.clip_grad_norm(self.model.parameters(), self.clip)
         self.optimizer.step()
 
     def reset(self):
@@ -363,12 +392,29 @@ class Seq2seqAgent(Agent):
             shared['states'] = self.states
         return shared
 
+    def extract_persona(self, text):
+        if not hasattr(self, 'persona'):
+            self.persona = ''
+        personas = []
+        ind = text.find('your persona: ')
+        while ind >= 0:
+            new_line = text.find('\n')
+            persona = text[ind + len('your persona: '):new_line]
+            personas.append(persona)
+            text = text[new_line + 1:]
+            ind = text.find('your persona: ')
+        if len(personas) > 0:
+            self.persona = '\n'.join(personas)
+        return self.persona, text
+
     def observe(self, observation):
         """Save observation for act.
         If multiple observations are from the same episode, concatenate them.
         """
         # shallow copy observation (deep copy can be expensive)
         obs = observation.copy()
+        obs['persona'], obs['text'] = self.extract_persona(obs.get('text', ''))
+        # obs['persona'], _ = self.extract_persona(obs.get('text', ''))
         batch_idx = self.opt.get('batchindex', 0)
         if not obs.get('preprocessed', False):
             obs['text2vec'] = maintain_dialog_history(
@@ -377,57 +423,166 @@ class Seq2seqAgent(Agent):
                 historyLength=self.truncate,
                 useReplies=self.opt['include_labels'],
                 dict=self.dict,
-                useStartEndIndices=False)
+                useStartEndIndices=True)
         else:
             obs['text2vec'] = deque(obs['text2vec'], maxlen=self.truncate)
         self.observation = obs
         self.answers[batch_idx] = None
         return obs
 
-    def predict(self, xs, ys=None, cands=None, valid_cands=None, is_training=False):
+
+    def predict(self, xs, ys=None, cands=None, valid_cands=None, lm=False, ps=None):
+
         """Produce a prediction from our model.
 
         Update the model using the targets if available, otherwise rank
         candidates as well if they are available and param is set.
         """
+        is_training = ys is not None 
         text_cand_inds, loss_dict = None, None
         if is_training:
             self.model.train()
             self.zero_grad()
-            predictions, scores, _ = self.model(xs, ys)
-            loss = self.criterion(scores.view(-1, scores.size(-1)), ys.view(-1))
-            loss.backward()
+
+            # predictions, scores, _ = self.model(xs, ys)
+            # loss = self.criterion(scores.view(-1, scores.size(-1)), ys.view(-1))
+            # loss.backward()
+
+            loss = 0
+            predictions, scores, _ = self.model(xs, ys, ps=ps)
+            # for i in range(scores.size(1)):
+            #     # sum loss per-token
+            #     score = scores.select(1, i)
+            #     y = ys.select(1, i)
+            #     loss += self.criterion(score, y)
+            loss += self.criterion(scores.view(-1, scores.size(-1)), ys.view(-1))
+
             self.update_params()
             loss_dict = {'loss': loss.data[0], 'ppl': (math.e**loss).data[0]}
         else:
             self.model.eval()
-            predictions, _scores, text_cand_inds = self.model(
-                xs, ys=None, cands=cands, valid_cands=valid_cands)
 
-            if ys is not None:
-                # calculate loss on targets
-                _, scores, _ = self.model(xs, ys)
-                loss = self.criterion(scores.view(-1, scores.size(-1)), ys.view(-1))
-                loss_dict = {'loss': loss.data[0], 'ppl': (math.e**loss).data[0]}
+            # predictions, _scores, text_cand_inds = self.model(
+            #     xs, ys=None, cands=cands, valid_cands=valid_cands)
+            #
+            # if ys is not None:
+            #     # calculate loss on targets
+            #     _, scores, _ = self.model(xs, ys)
+            #     loss = self.criterion(scores.view(-1, scores.size(-1)), ys.view(-1))
+            #     loss_dict = {'loss': loss.data[0], 'ppl': (math.e**loss).data[0]}
+
+            predictions, scores, text_cand_inds = self.model(xs, ys, cands,
+                                                             valid_cands, ps=ps)
+
 
         return predictions, text_cand_inds, loss_dict
 
-    def vectorize(self, observations):
+    def batchify(self, observations, lm=False):
         """Convert a list of observations into input & target tensors."""
-        is_training = any(['labels' in obs for obs in observations])
-        xs, ys, labels, valid_inds, _, _ = PaddingUtils.pad_text(
-            observations, self.dict, self.END_IDX, self.NULL_IDX, dq=True,
-            eval_labels=True, truncate=self.truncate)
-        if xs is None:
+
+        # is_training = any(['labels' in obs for obs in observations])
+        # xs, ys, labels, valid_inds, _, _ = PaddingUtils.pad_text(
+        #     observations, self.dict, self.END_IDX, self.NULL_IDX, dq=True,
+        #     eval_labels=True, truncate=self.truncate)
+        # if xs is None:
+        #     return None, None, None, None, None, None, None
+        # xs = torch.LongTensor(xs)
+        # ys = torch.LongTensor(ys)
+        # if self.use_cuda:
+        #     # copy to gpu
+        #     self.xs.resize_(xs.size())
+        #     self.xs.copy_(xs)
+        #     xs = Variable(self.xs)
+        #     if ys is not None:
+
+        def valid(obs):
+            # check if this is an example our model should actually process
+            return 'text2vec' in obs and len(obs['text2vec']) > 0
+        try:
+            # valid examples and their indices
+            valid_inds, exs = zip(*[(i, ex) for i, ex in
+                                    enumerate(observations) if valid(ex)])
+        except ValueError:
+            # zero examples to process in this batch, so zip failed to unpack
             return None, None, None, None, None, None, None
-        xs = torch.LongTensor(xs)
-        ys = torch.LongTensor(ys)
-        if self.use_cuda:
-            # copy to gpu
-            self.xs.resize_(xs.size())
-            self.xs.copy_(xs)
+
+        # set up the input tensors
+        bsz = len(exs)
+
+        # `x` text is already tokenized and truncated
+        # sort by length so we can use pack_padded
+        parsed_x = [ex['text2vec'] for ex in exs]
+        x_lens = [len(x) for x in parsed_x]
+        ind_sorted = sorted(range(len(x_lens)), key=lambda k: -x_lens[k])
+
+        exs = [exs[k] for k in ind_sorted]
+        valid_inds = [valid_inds[k] for k in ind_sorted]
+        parsed_x = [parsed_x[k] for k in ind_sorted]
+
+        labels_avail = any(['labels' in ex for ex in exs])
+
+
+        if lm:
+            self.xs.resize_(bsz, 1)
+            self.xs.fill_(self.START_IDX)
             xs = Variable(self.xs)
-            if ys is not None:
+        else:
+            max_x_len = max([len(x) for x in parsed_x])
+
+            # TODO: move zero padding to utility function?
+            parsed_x = [x if len(x) == max_x_len else
+                        x + deque((self.NULL_IDX,)) * (max_x_len - len(x))
+                        for x in parsed_x]
+            xs = torch.LongTensor(parsed_x)
+            if self.use_cuda:
+                # copy to gpu
+                self.xs.resize_(xs.size())
+                self.xs.copy_(xs, async=True)
+                xs = Variable(self.xs)
+            else:
+                xs = Variable(xs)
+
+        ps = None
+        if any([ex.get('persona') for ex in exs]):
+            personas = [ex.get('persona', '') for ex in exs]
+            parsed_p = [deque(self.parse(p), maxlen=self.truncate) for p in personas]
+            max_p_len = max([len(p) for p in parsed_p])
+            parsed_p = [p if len(p) == max_p_len else
+                        p + deque((self.NULL_IDX,)) * (max_p_len - len(p))
+                        for p in parsed_p]
+            ps = torch.LongTensor(parsed_p)
+            if self.use_cuda:
+                self.ps.resize_(ps.size())
+                self.ps.copy_(ps, async=True)
+                ps = Variable(self.ps)
+            else:
+                ps = Variable(ps)
+
+        # set up the target tensors
+        ys = None
+        labels = None
+        if labels_avail:
+            # randomly select one of the labels to update on, if multiple
+            labels = [random.choice(ex.get('labels', [''])) for ex in exs]
+            # parse each label and append END
+            parsed_y = [deque(maxlen=self.truncate) for _ in labels]
+            for dq, y in zip(parsed_y, labels):
+                dq.extendleft(reversed(self.parse(y)))
+            for y in parsed_y:
+                y.append(self.END_IDX)
+            if lm:
+                for x, y in zip(parsed_x, parsed_y):
+                    if y.maxlen is not None:
+                        y = deque(y, maxlen=y.maxlen * 2)
+                    y.extendleft(reversed(x))
+
+            max_y_len = max(len(y) for y in parsed_y)
+            parsed_y = [y if len(y) == max_y_len else
+                        y + deque((self.NULL_IDX,)) * (max_y_len - len(y))
+                        for y in parsed_y]
+            ys = torch.LongTensor(parsed_y)
+            if self.use_cuda:
+                # copy to gpu
                 self.ys.resize_(ys.size())
                 self.ys.copy_(ys)
                 ys = Variable(self.ys)
@@ -439,7 +594,7 @@ class Seq2seqAgent(Agent):
         # set up candidates
         cands = None
         valid_cands = None
-        if not is_training and self.rank:
+        if ys is None and self.rank:
             # only do ranking when no targets available and ranking flag set
             parsed_cs = []
             valid_cands = []
@@ -472,7 +627,11 @@ class Seq2seqAgent(Agent):
                 else:
                     cands = Variable(cands)
 
-        return xs, ys, labels, valid_inds, cands, valid_cands, is_training
+
+        # return xs, ys, labels, valid_inds, cands, valid_cands, is_training
+
+        return xs, ys, labels, valid_inds, cands, valid_cands, ps
+
 
     def batch_act(self, observations):
         batchsize = len(observations)
@@ -483,39 +642,98 @@ class Seq2seqAgent(Agent):
         # valid_inds tells us the indices of all valid examples
         # e.g. for input [{}, {'text': 'hello'}, {}, {}], valid_inds is [1]
         # since the other three elements had no 'text' field
-        xs, ys, labels, valid_inds, cands, valid_cands, is_training = self.vectorize(observations)
+
+        # xs, ys, labels, valid_inds, cands, valid_cands, is_training = self.vectorize(observations)
+
+        xs, ys, labels, valid_inds, cands, valid_cands, ps = self.batchify(observations)
+
 
         if xs is None:
             # no valid examples, just return empty responses
             return batch_reply
 
-        # produce predictions, train on targets if availables
-        predictions, text_cand_inds, loss = self.predict(xs, ys, cands, valid_cands, is_training)
-        if loss is not None:
-            if 'metrics' in batch_reply[0]:
-                for k, v in loss.items():
-                    batch_reply[0]['metrics'][k] = v
-            else:
+
+        # # produce predictions, train on targets if availables
+        # predictions, text_cand_inds, loss = self.predict(xs, ys, cands, valid_cands, is_training)
+        # if loss is not None:
+        #     if 'metrics' in batch_reply[0]:
+        #         for k, v in loss.items():
+        #             batch_reply[0]['metrics'][k] = v
+        #     else:
+        #         batch_reply[0]['metrics'] = loss
+        #
+        #
+        # if is_training:
+        #     report_freq = 0
+        # else:
+        #     report_freq = 0.01
+        # PaddingUtils.map_predictions(
+        #     predictions.cpu().data, valid_inds, batch_reply, observations,
+        #     self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
+        #     answers=self.answers, ys=ys.data)
+        #
+        # if text_cand_inds is not None:
+        #     text_cand_inds = text_cand_inds.cpu().data
+        #     for i in range(len(valid_cands)):
+        #         order = text_cand_inds[i]
+        #         _, batch_idx, curr_cands = valid_cands[i]
+        #         curr = batch_reply[batch_idx]
+        #         curr['text_candidates'] = [curr_cands[idx] for idx in order
+        #                                    if idx < len(curr_cands)]
+
+        if self.lm != 'none' and ys is not None:
+            # train on lm task: given [START], predict [x y]
+            # (regular task is given [x START] produce [y])
+            xs, ys, _, _, _, _ = self.batchify(observations, lm=True)
+            _, _, loss = self.predict(xs, ys, lm=True, ps=ps)
+            if loss is not None:
                 batch_reply[0]['metrics'] = loss
 
+        if self.lm != 'only' or ys is None:
+            # produce predictions, train on targets if availables
+            predictions, text_cand_inds, loss = self.predict(xs, ys, cands, valid_cands, ps=ps)
+            if loss is not None:
+                if 'metrics' in batch_reply[0]:
+                    for k, v in loss.items():
+                        batch_reply[0]['metrics'][k] = v
+                else:
+                    batch_reply[0]['metrics'] = loss
 
-        if is_training:
-            report_freq = 0
-        else:
-            report_freq = 0.01
-        PaddingUtils.map_predictions(
-            predictions.cpu().data, valid_inds, batch_reply, observations,
-            self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
-            answers=self.answers, ys=ys.data)
+            predictions = predictions.cpu()
+            for i in range(len(predictions)):
+                # map the predictions back to non-empty examples in the batch
+                # we join with spaces since we produce tokens one at a time
+                curr = batch_reply[valid_inds[i]]
+                output_tokens = []
+                for c in predictions.data[i]:
+                    if c == self.END_IDX:
+                        break
+                    else:
+                        output_tokens.append(c)
+                curr_pred = self.v2t(output_tokens)
+                curr['text'] = curr_pred
+                if labels is not None:
+                    y = []
+                    for c in ys.data[i]:
+                        if c == self.END_IDX:
+                            break
+                        else:
+                            y.append(c)
+                    self.answers[valid_inds[i]] = y
+                else:
+                    self.answers[valid_inds[i]] = output_tokens
+            if labels is None and random.random() > 0.2:
+                print('prediction: ', curr_pred)
 
-        if text_cand_inds is not None:
-            text_cand_inds = text_cand_inds.cpu().data
-            for i in range(len(valid_cands)):
-                order = text_cand_inds[i]
-                _, batch_idx, curr_cands = valid_cands[i]
-                curr = batch_reply[batch_idx]
-                curr['text_candidates'] = [curr_cands[idx] for idx in order
-                                           if idx < len(curr_cands)]
+            if text_cand_inds is not None:
+                text_cand_inds = text_cand_inds.cpu().data
+                for i in range(len(valid_cands)):
+                    order = text_cand_inds[i]
+                    _, batch_idx, curr_cands = valid_cands[i]
+                    curr = batch_reply[batch_idx]
+                    curr['text_candidates'] = [curr_cands[idx] for idx in order
+                                               if idx < len(curr_cands)]
+
 
         return batch_reply
 
