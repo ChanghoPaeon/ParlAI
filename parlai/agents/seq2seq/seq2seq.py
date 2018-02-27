@@ -119,14 +119,26 @@ class Seq2seqAgent(Agent):
                                 'Any member of torch.optim is valid and will '
                                 'be used with default params except learning '
                                 'rate (as specified by -lr).')
+        # agent.add_argument('-emb', '--embedding-type', default='random',
+        #                    choices=['random'],
+        #                    help='Choose between different strategies '
+        #                         'for word embeddings. Default is random, '
+        #                         'but can also preinitialize from Glove.'
+        #                         'Preinitialized embeddings can also be fixed '
+        #                         'so they are not updated during training. '
+        #                         'NOTE: glove init currently disabled.')
+
         agent.add_argument('-emb', '--embedding-type', default='random',
-                           choices=['random'],
+                           choices=['random', 'glove', 'glove-fixed',
+                                    'fasttext', 'fasttext-fixed'],
                            help='Choose between different strategies '
                                 'for word embeddings. Default is random, '
-                                'but can also preinitialize from Glove.'
+                                'but can also preinitialize from Glove or '
+                                'Fasttext.'
                                 'Preinitialized embeddings can also be fixed '
-                                'so they are not updated during training. '
-                                'NOTE: glove init currently disabled.')
+                                'so they are not updated during training.')
+
+
         agent.add_argument('-lm', '--language-model', default='none',
                            choices=['none', 'only', 'both'],
                            help='Enabled language modeling training on the '
@@ -201,6 +213,39 @@ class Seq2seqAgent(Agent):
                                  start_idx=self.START_IDX,
                                  end_idx=self.END_IDX,
                                  longest_label=self.states.get('longest_label', 1))
+
+            if opt['embedding_type'] != 'random':
+                # set up preinitialized embeddings
+                try:
+                    import torchtext.vocab as vocab
+                except ModuleNotFoundError as ex:
+                    print('Please install torch text with `pip install torchtext`')
+                    raise ex
+                if opt['embedding_type'].startswith('glove'):
+                    init = 'glove'
+                    embs = vocab.GloVe(name='840B', dim=300)
+                elif opt['embedding_type'].startswith('fasttext'):
+                    init = 'fasttext'
+                    embs = vocab.FastText(language='en')
+                else:
+                    raise RuntimeError('embedding type not implemented')
+
+                if opt['embeddingsize'] != 300:
+                    rp = torch.Tensor(300, opt['embeddingsize']).normal_()
+                    t = lambda x: torch.mm(x.unsqueeze(0), rp)
+                else:
+                    t = lambda x: x
+                cnt = 0
+                for w, i in self.dict.tok2ind.items():
+                    if w in embs.stoi:
+                        vec = t(embs.vectors[embs.stoi[w]])
+                        self.model.decoder.lt.weight.data[i] = vec
+                        cnt += 1
+                        if opt['lookuptable'] in ['unique', 'dec_out']:
+                            # also set encoder lt, since it's not shared
+                            self.model.encoder.lt.weight.data[i] = vec
+                print('Seq2seq: initialized embeddings for {} tokens from {}.'
+                      ''.format(cnt, init))
 
             if self.states:
                 # set loaded states if applicable
