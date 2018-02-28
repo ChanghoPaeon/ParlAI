@@ -353,6 +353,7 @@ task_list = [
         "task": "personachat",
         "tags": [ "ChitChat", "All" ],
         "description": "A chit-chat dataset where paired Turkers are given assigned personas and chat to try to get to know each other. See the paper: https://arxiv.org/abs/1801.07243"
+
     },
     {
         "id": "Twitter",
@@ -369,4 +370,5 @@ task_list = [
         "description": "Dump of Wikipedia articles from 2/3/18",
         "notes": "Specify ':full' for the full articles to be returned, otherwise defaults to ':summary', which provides the first paragraphs. To put the article in the labels and the title in the text, specify ':key-value' at the end (for a title/content key-value association)"
     },
+
 ]
